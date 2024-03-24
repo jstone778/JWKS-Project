@@ -8,6 +8,29 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.backends import default_backend
 import os
+import sqlite3
+
+# Function to serialize private key to PKCS1 PEM format
+def serialize_private_key(private_key):
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+
+# Function to deserialize private key from PKCS1 PEM format
+def deserialize_private_key(serialized_key):
+    return serialization.load_pem_private_key(serialized_key, password=None, backend=default_backend())
+
+conn = sqlite3.connect('totally_not_my_privateKeys.db', check_same_thread=False)
+
+cursor = conn.cursor()
+
+cursor.execute('''CREATE TABLE IF NOT EXISTS keys(
+    kid INTEGER PRIMARY KEY AUTOINCREMENT,
+    key BLOB NOT NULL,
+    exp INTEGER NOT NULL
+)''')
 
 # Creates the app
 app = Flask(__name__)
@@ -48,12 +71,8 @@ def generate_rsa_key_pair():
         backend=default_backend()
     )
 
-    # Generates the public key for the pair
-    public_key = private_key.public_key()
-
-    # Encodes the key using base64url
-    modulus_bytes = public_key.public_numbers().n.to_bytes(256, byteorder='big')
-    modulus_b64url = base64.urlsafe_b64encode(modulus_bytes).rstrip(b'=').decode()
+    # Serialize private key to PKCS1 PEM format
+    serialized_private_key = serialize_private_key(private_key)
 
     # Retrieves the public keys stored in the json file
     try:
@@ -66,24 +85,11 @@ def generate_rsa_key_pair():
     key_id = f"key{len(public_keys) + 1}"
 
     # Calculates the expiry timestamp to be one day from when this function was called
-    expiry_timestamp = (datetime.utcnow() + timedelta(days=1)).timestamp()
+    expiry_timestamp = int((datetime.utcnow() + timedelta(days=1)).timestamp())
 
-    # Dictionary to hold the key info of the public key
-    key_info = {
-        "kid": key_id,
-        "alg": "RS256",
-        "kty": "RSA",
-        "use": "sig",
-        "n": modulus_b64url,
-        "exp": expiry_timestamp
-    }
-
-    # Update the public_keys global variable to hold the new public key
-    public_keys[key_id] = key_info
-
-    # Redump the public keys back into the json file with the new one added
-    with open('public_key.json', 'w') as f:
-        json.dump(public_keys, f)
+    # Insert private key and expiry into the database
+    cursor.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (serialized_private_key.decode(), int(expiry_timestamp)))
+    conn.commit()
 
     # Precautionary load of the public keys
     public_keys = load_public_keys()
@@ -93,6 +99,10 @@ def generate_rsa_key_pair():
 
 # Function to generate an expired RSA key pair
 def generate_expired_rsa_key_pair():
+    # Connect to the SQLite database
+    conn = sqlite3.connect('totally_not_my_privateKeys.db')
+    cursor = conn.cursor()
+
     global public_keys
     # Generates a private RSA key
     private_key = rsa.generate_private_key(
@@ -100,12 +110,9 @@ def generate_expired_rsa_key_pair():
         key_size=2048,
         backend=default_backend()
     )
-    # Generates a public RSA key
-    public_key = private_key.public_key()
-
-    # Encodes the n value using base64url
-    modulus_bytes = public_key.public_numbers().n.to_bytes(256, byteorder='big')
-    modulus_b64url = base64.urlsafe_b64encode(modulus_bytes).rstrip(b'=').decode()
+    
+    # Serialize private key to PKCS1 PEM format
+    serialized_private_key = serialize_private_key(private_key)
     
     # Loads all of the public keys
     try:
@@ -118,24 +125,14 @@ def generate_expired_rsa_key_pair():
     key_id = f"key{len(public_keys) + 1}"
 
     # Sets the expiry timestamp to a day previous to when it was created
-    expiry_timestamp = (datetime.utcnow() - timedelta(days=1)).timestamp()
+    expiry_timestamp = int((datetime.utcnow() - timedelta(days=1)).timestamp())
 
-    # Sets the key info for the public key
-    key_info = {
-        "kid": key_id,
-        "alg": "RS256",
-        "kty": "RSA",
-        "use": "sig",
-        "n": modulus_b64url,
-        "exp": expiry_timestamp
-    }
+    # Insert private key and expiry into the database
+    cursor.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (serialized_private_key.decode(), int(expiry_timestamp)))
+    conn.commit()
 
-    # Updates the public keys with the new key
-    public_keys[key_id] = key_info
+    conn.close()
 
-    # Redumps all of the public keys
-    with open('public_key.json', 'w') as f:
-        json.dump(public_keys, f)
 
     # Precautionary load of the public keys
     public_keys = load_public_keys()
@@ -143,53 +140,98 @@ def generate_expired_rsa_key_pair():
     # Returns the private key, key id and expiry timestamp
     return private_key, key_id, expiry_timestamp
 
+def check_and_initialize_keys():
+    # Connect to the SQLite database
+    conn = sqlite3.connect('totally_not_my_privateKeys.db')
+    cursor = conn.cursor()
+
+    # Check if there are any rows in the keys table
+    cursor.execute("SELECT COUNT(*) FROM keys")
+    row_count = cursor.fetchone()[0]
+
+    if row_count == 0:
+        # Database is empty, generate key pairs
+        expired_private_key, expired_key_id, expired_expiry = generate_expired_rsa_key_pair()
+        private_key, key_id = generate_rsa_key_pair()
+
+        # Insert expired key into the database
+        cursor.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (serialize_private_key(expired_private_key).decode(), expired_expiry))
+
+        # Insert non-expired key into the database
+        cursor.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (serialize_private_key(private_key).decode(), (datetime.utcnow() + timedelta(days=1)).timestamp()))
+
+        # Commit the transaction
+        conn.commit()
+
+    # Close the database connection
+    conn.close()
+
+# Call the function to check and initialize keys if needed
+check_and_initialize_keys()
+
+
 # Route to retrieve JWKS
 @app.route('/.well-known/jwks.json')
 def get_jwks():
-    # Calculates the current time
+    # Calculate the current time
     current_time = datetime.utcnow().timestamp()
-    # Creates the valid keys variable
-    valid_keys = []
-    # Loops through all of the keys stored in public_keys
-    for kid, key_info in public_keys.items():
-        # Gets what the expiry is of the key
-        expiry = key_info["exp"] if "exp" in key_info else 0
-        # Calculates whether the expiration timestap is past what the current time is
-        if expiry > current_time:
-            # Key is not expired, include it in the JWKS response
-            valid_keys.append({
-                "kid": kid,
-                "alg": key_info["alg"],
-                "kty": key_info["kty"],
-                "use": key_info["use"],
-                "n": key_info["n"],
-                "e": "AQAB",
-                "exp": key_info["exp"]
-            })
-    # Make the JWKS variable
-    jwks = {"keys": valid_keys}
+
+    # Retrieve all valid (non-expired) private keys from the database
+    cursor.execute("SELECT key FROM keys WHERE exp >= ?", (current_time,))
+    valid_private_keys = [deserialize_private_key(row[0].encode()) for row in cursor.fetchall()]
+
+    # Create the JWKS response from the valid private keys
+    jwks = {
+        "keys": [{
+            "kid": f"key{i + 1}",
+            "alg": "RS256",
+            "kty": "RSA",
+            "use": "sig",
+            "n": base64.urlsafe_b64encode(key.public_key().public_numbers().n.to_bytes(256, byteorder='big')).decode().rstrip('='),
+            "e": "AQAB"
+        } for i, key in enumerate(valid_private_keys)]
+    }
+
     # Return the JWKS as a JSON Object
     return jsonify(jwks)
+
 
 # Route for authentication
 @app.route('/auth', methods=['POST'])
 def auth():
     # Check if the 'expired' query parameter is present
     expired = request.args.get('expired') == 'true'
-
+    check_and_initialize_keys()
     if expired:
-        # Generate an expired key pair and set an expired expiry
-        expired_private_key, key_id, expiry = generate_expired_rsa_key_pair()
+        # Read an expired key from the database
+        cursor.execute("SELECT key FROM keys WHERE exp < ?", (datetime.utcnow().timestamp(),))
+        row = cursor.fetchone()
+        if row:
+            # Deserialize the private key
+            private_key = deserialize_private_key(row[0].encode())
 
-        # Generate JWT using the expired key pair and expiry
-        token = jwt.encode({'username': 'example_user', 'exp': expiry}, expired_private_key, algorithm='RS256', headers={'kid': key_id})
+            # Generate JWT using the expired key
+            # Assuming private_key is an instance of RSAPrivateKey
+            token = jwt.encode({'username': 'userABC', 'password': 'password123'}, private_key, algorithm='RS256', headers={"kid": "key1"})
+        else:
+            token = "Expired key not found"
     else:
-        # Generate a new key pair and token with current expiry
-        private_key, key_id = generate_rsa_key_pair()
-        token = jwt.encode({'username': 'example_user'}, private_key, headers = {'kid': key_id, 'alg': 'RS256'})
-    
-    #Returns the JWT token
+        # Read a valid (unexpired) key from the database
+        cursor.execute("SELECT key FROM keys WHERE exp >= ?", (datetime.utcnow().timestamp(),))
+        row = cursor.fetchone()
+        if row:
+            # Deserialize the private key
+            private_key = deserialize_private_key(row[0].encode())
+
+            # Generate JWT using the valid key
+            token = jwt.encode({'username': 'userABC', 'password': 'password123'}, private_key, algorithm='RS256', headers={"kid": "key1"})
+        else:
+            token = "Valid key not found"
+
+    # Returns the JWT token or an error message
     return token
+
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)
+    conn.close()
