@@ -1,5 +1,7 @@
 import unittest
 import requests
+import jwt
+from cryptography.hazmat.primitives import serialization
 
 class TestFakeJWKS(unittest.TestCase):
     def test_get_jwks(self):
@@ -18,7 +20,7 @@ class TestFakeJWKS(unittest.TestCase):
             self.assertIn('kty', key)
             self.assertIn('use', key)
             self.assertIn('n', key)
-            self.assertIn('exp', key)
+            self.assertIn('e', key)
 
     def test_auth(self):
         response = requests.post('http://localhost:8080/auth')
@@ -48,7 +50,7 @@ class TestFakeJWKS(unittest.TestCase):
             assert 'kty' in key
             assert 'use' in key
             assert 'n' in key
-            assert 'exp' in key
+            assert 'e' in key
 
 if __name__ == '__main__':
     unittest.main()
